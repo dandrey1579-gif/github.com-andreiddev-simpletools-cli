@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """simpletools CLI v1.0 – Управление инфраструктурой через текстовые команды."""
-import sys, json, uuid, os, re
+import sys
+import os
+
+# Гарантирует, что модули проекта (db, policy_engine и др.) всегда будут найдены
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import json
+import uuid
+import re
 from datetime import datetime
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
