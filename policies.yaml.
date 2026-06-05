@@ -1,0 +1,16 @@
+rules:
+  - name: "Запрет удаления prod-ресурсов"
+    description: "Нельзя удалять ресурсы с меткой env=prod без явного разрешения"
+    condition:
+      action: DELETE
+      labels:
+        env: prod
+    effect: DENY
+    message: "❌ Удаление prod-ресурсов запрещено. Добавьте аннотацию approved-by."
+
+  - name: "Предупреждение о создании облачных ресурсов"
+    description: "Предупреждаем о расходах при создании облачных ресурсов"
+    condition:
+      action: CREATE
+    effect: WARN
+    message: "⚠️ Создание облачного ресурса. Проверьте бюджет."
