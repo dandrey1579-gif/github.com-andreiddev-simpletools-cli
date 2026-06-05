@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""simpletools CLI v1.0 – Управление инфраструктурой через текстовые команды."""
+"""
+simpletools CLI v1.0 – Управление инфраструктурой через текстовые команды.
+Модель: WISH → SEE → SAY
+Провайдеры: GitHub, AWS S3
+
+Все модули (db, policy_engine, worker, webui) встроены в этот файл.
+"""
+
 import sys
 import os
-
-# Гарантирует, что текущая папка и модули проекта будут найдены
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import json
 import uuid
 import re
 import sqlite3
+import time
 from datetime import datetime
+from flask import Flask, render_template_string, request, redirect, url_for
 
-# ---------- ВСТРОЕННЫЙ МОДУЛЬ db (начало) ----------
+# ===================== ВСТРОЕННЫЙ МОДУЛЬ db =====================
 DB_PATH = os.environ.get("SIMPLETOOLS_DB", "simpletools.db")
 
 def get_connection():
@@ -84,13 +89,49 @@ def delete_desired_state(rid):
     conn.execute("DELETE FROM desired_state WHERE resource_id=?", (rid,))
     conn.commit()
     conn.close()
-# ---------- ВСТРОЕННЫЙ МОДУЛЬ db (конец) ----------
 
+# ===================== ВСТРОЕННЫЙ POLICY ENGINE =====================
+import yaml
+
+POLICIES_FILE = os.environ.get("SIMPLETOOLS_POLICIES", "policies.yaml")
+
+def load_policies():
+    try:
+        with open(POLICIES_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {"rules": []}
+
+def check_policies(manifest):
+    policies = load_policies()
+    result = {"allowed": True, "warnings": [], "errors": []}
+    for rule in policies.get("rules", []):
+        cond = rule.get("condition", {})
+        match = True
+        if "action" in cond and manifest.get("operation", "").upper() != cond["action"].upper():
+            match = False
+        if "labels" in cond:
+            mlabels = manifest.get("spec", {}).get("labels", {})
+            for k, v in cond["labels"].items():
+                if mlabels.get(k) != v:
+                    match = False
+        if match:
+            effect = rule.get("effect", "WARN")
+            msg = rule.get("message", "Нарушение политики")
+            if effect == "DENY":
+                result["allowed"] = False
+                result["errors"].append(msg)
+            elif effect == "WARN":
+                result["warnings"].append(msg)
+    return result
+
+# ===================== КОНФИГУРАЦИЯ =====================
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-central-1")
 
+# ===================== WISH / SEE / EXECUTE =====================
 def parse_wish(text):
     text = text.lower().strip()
     if "github" in text and ("репозиторий" in text or "repo" in text):
@@ -218,6 +259,113 @@ def execute(manifest):
                 return {"status": "FAILED"}
     return {"status": "FAILED", "error": "Неизвестный провайдер"}
 
+# ===================== ВСТРОЕННЫЙ WORKER =====================
+CHECK_INTERVAL = int(os.environ.get("SIMPLETOOLS_INTERVAL", "300"))
+
+def check_resource(desired):
+    if desired["provider"] == "github" and desired["resource_type"] == "Repository":
+        import requests
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            return None
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        try:
+            resp = requests.get("https://api.github.com/user/repos", headers=headers, params={"per_page": 100})
+            if resp.ok:
+                repos = [r["name"] for r in resp.json()]
+                if desired["spec"].get("name") not in repos:
+                    op_id = f"drift-{uuid.uuid4().hex[:8]}"
+                    manifest = {"kind": "github:Repository", "operation": "CREATE", "spec": desired["spec"], "reason": "DRIFT_DETECTED"}
+                    save_operation(op_id, "PENDING", manifest)
+                    return {"operation_id": op_id, "resource_id": desired["resource_id"], "action": "CREATE", "reason": "Ресурс отсутствует в реальности"}
+        except:
+            pass
+    return None
+
+def run_worker():
+    init_db()
+    print(f"Worker запущен. Интервал: {CHECK_INTERVAL} сек.")
+    while True:
+        try:
+            for res in get_all_desired_state():
+                result = check_resource(res)
+                if result:
+                    print(f"Дрейф: {result['resource_id']}")
+            time.sleep(CHECK_INTERVAL)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(e)
+            time.sleep(CHECK_INTERVAL)
+
+# ===================== ВСТРОЕННЫЙ WEB UI =====================
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>simpletools</title>
+</head>
+<body style="background:#0a0e14;color:#b0b8c4;font-family:sans-serif;padding:40px">
+    <h1>simpletools</h1>
+    <form method="post" action="/wish">
+        <textarea name="wish_text" rows="3" style="width:100%;background:#131820;color:#e6edf3">{{ wish_text or '' }}</textarea>
+        <br>
+        <button type="submit" style="background:#7aa2f7;color:#fff;padding:12px 28px">SEE</button>
+    </form>
+    {% if plan %}
+    <div style="background:#131820;padding:20px;margin-top:20px">
+        <p>{{ plan.summary }}</p>
+        {% if allowed %}
+        <a href="/say/{{ operation_id }}/yes" style="background:#73daca;color:#000;padding:12px 28px;margin:5px">ДА</a>
+        <a href="/say/{{ operation_id }}/no" style="border:1px solid #f7768e;color:#f7768e;padding:12px 28px;margin:5px">НЕТ</a>
+        {% endif %}
+    </div>
+    {% endif %}
+    <div style="margin-top:20px">
+        {% for op in operations %}
+        <p>{{ op.id }} {{ op.status }}</p>
+        {% endfor %}
+    </div>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE, operations=list_operations(10))
+
+@app.route("/wish", methods=["POST"])
+def wish():
+    wish_text = request.form.get("wish_text", "").strip()
+    if not wish_text:
+        return redirect(url_for("index"))
+    parsed = parse_wish(wish_text)
+    if "error" in parsed:
+        return render_template_string(HTML_TEMPLATE, operations=list_operations(10), wish_text=wish_text, plan={"summary": f"Ошибка: {parsed['error']}"})
+    manifest = formalize(parsed)
+    plan = calculate_plan(manifest)
+    policy_result = check_policies(manifest)
+    op_id = f"op-{uuid.uuid4().hex[:8]}"
+    save_operation(op_id, "PENDING", manifest)
+    return render_template_string(HTML_TEMPLATE, operations=list_operations(10), wish_text=wish_text, plan=plan, operation_id=op_id, allowed=policy_result["allowed"])
+
+@app.route("/say/<op_id>/<decision>")
+def say(op_id, decision):
+    op = get_operation(op_id)
+    if not op:
+        return "Not found", 404
+    if decision == "no":
+        save_operation(op_id, "REJECTED", op["manifest"])
+    elif decision == "yes":
+        save_operation(op_id, "IN_PROGRESS", op["manifest"])
+        result = execute(op["manifest"])
+        save_operation(op_id, result.get("status", "UNKNOWN"), op["manifest"], result)
+    return redirect(url_for("index"))
+
+# ===================== ИНТЕРАКТИВНЫЙ CLI =====================
 def run_interactive(user_text):
     print("WISH:", user_text)
     parsed = parse_wish(user_text)
@@ -225,7 +373,6 @@ def run_interactive(user_text):
         print(parsed["error"])
         return
     manifest = formalize(parsed)
-    from policy_engine import check_policies
     policy_result = check_policies(manifest)
     if policy_result["warnings"]:
         for w in policy_result["warnings"]:
@@ -248,6 +395,7 @@ def run_interactive(user_text):
     else:
         print("Отменено.")
 
+# ===================== ТОЧКА ВХОДА =====================
 if __name__ == "__main__":
     init_db()
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h"):
@@ -263,8 +411,9 @@ if __name__ == "__main__":
             if op:
                 print(json.dumps(op, indent=2, ensure_ascii=False))
     elif sys.argv[1] == "worker":
-        from worker import run_worker
         run_worker()
     elif sys.argv[1] == "web":
-        from webui import app
-        app.run(host="0.0.0.0", port=5000)
+        print("🌐 Запуск веб-интерфейса: http://localhost:5000")
+        app.run(host="0.0.0.0", port=5000, debug=True)
+    else:
+        print(f"Неизвестная команда: {sys.argv[1]}")
