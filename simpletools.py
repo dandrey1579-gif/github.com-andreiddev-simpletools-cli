@@ -15,9 +15,8 @@ import re
 import sqlite3
 import time
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for
 
-# ===================== ВСТРОЕННЫЙ МОДУЛЬ db =====================
+# ---------- ВСТРОЕННЫЙ МОДУЛЬ db ----------
 DB_PATH = os.environ.get("SIMPLETOOLS_DB", "simpletools.db")
 
 def get_connection():
@@ -90,12 +89,17 @@ def delete_desired_state(rid):
     conn.commit()
     conn.close()
 
-# ===================== ВСТРОЕННЫЙ POLICY ENGINE =====================
-import yaml
+# ---------- ВСТРОЕННЫЙ POLICY ENGINE ----------
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 POLICIES_FILE = os.environ.get("SIMPLETOOLS_POLICIES", "policies.yaml")
 
 def load_policies():
+    if yaml is None:
+        return {"rules": []}
     try:
         with open(POLICIES_FILE, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
@@ -125,13 +129,13 @@ def check_policies(manifest):
                 result["warnings"].append(msg)
     return result
 
-# ===================== КОНФИГУРАЦИЯ =====================
+# ---------- КОНФИГУРАЦИЯ ----------
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-central-1")
 
-# ===================== WISH / SEE / EXECUTE =====================
+# ---------- WISH / SEE / EXECUTE ----------
 def parse_wish(text):
     text = text.lower().strip()
     if "github" in text and ("репозиторий" in text or "repo" in text):
@@ -259,7 +263,7 @@ def execute(manifest):
                 return {"status": "FAILED"}
     return {"status": "FAILED", "error": "Неизвестный провайдер"}
 
-# ===================== ВСТРОЕННЫЙ WORKER =====================
+# ---------- ВСТРОЕННЫЙ WORKER ----------
 CHECK_INTERVAL = int(os.environ.get("SIMPLETOOLS_INTERVAL", "300"))
 
 def check_resource(desired):
@@ -298,8 +302,13 @@ def run_worker():
             print(e)
             time.sleep(CHECK_INTERVAL)
 
-# ===================== ВСТРОЕННЫЙ WEB UI =====================
-app = Flask(__name__)
+# ---------- ВСТРОЕННЫЙ WEB UI ----------
+try:
+    from flask import Flask, render_template_string, request, redirect, url_for
+except ImportError:
+    Flask = None
+
+app = Flask(__name__) if Flask else None
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -333,39 +342,40 @@ HTML_TEMPLATE = """
 </html>
 """
 
-@app.route("/")
-def index():
-    return render_template_string(HTML_TEMPLATE, operations=list_operations(10))
+if app:
+    @app.route("/")
+    def index():
+        return render_template_string(HTML_TEMPLATE, operations=list_operations(10))
 
-@app.route("/wish", methods=["POST"])
-def wish():
-    wish_text = request.form.get("wish_text", "").strip()
-    if not wish_text:
+    @app.route("/wish", methods=["POST"])
+    def wish():
+        wish_text = request.form.get("wish_text", "").strip()
+        if not wish_text:
+            return redirect(url_for("index"))
+        parsed = parse_wish(wish_text)
+        if "error" in parsed:
+            return render_template_string(HTML_TEMPLATE, operations=list_operations(10), wish_text=wish_text, plan={"summary": f"Ошибка: {parsed['error']}"})
+        manifest = formalize(parsed)
+        plan = calculate_plan(manifest)
+        policy_result = check_policies(manifest)
+        op_id = f"op-{uuid.uuid4().hex[:8]}"
+        save_operation(op_id, "PENDING", manifest)
+        return render_template_string(HTML_TEMPLATE, operations=list_operations(10), wish_text=wish_text, plan=plan, operation_id=op_id, allowed=policy_result["allowed"])
+
+    @app.route("/say/<op_id>/<decision>")
+    def say(op_id, decision):
+        op = get_operation(op_id)
+        if not op:
+            return "Not found", 404
+        if decision == "no":
+            save_operation(op_id, "REJECTED", op["manifest"])
+        elif decision == "yes":
+            save_operation(op_id, "IN_PROGRESS", op["manifest"])
+            result = execute(op["manifest"])
+            save_operation(op_id, result.get("status", "UNKNOWN"), op["manifest"], result)
         return redirect(url_for("index"))
-    parsed = parse_wish(wish_text)
-    if "error" in parsed:
-        return render_template_string(HTML_TEMPLATE, operations=list_operations(10), wish_text=wish_text, plan={"summary": f"Ошибка: {parsed['error']}"})
-    manifest = formalize(parsed)
-    plan = calculate_plan(manifest)
-    policy_result = check_policies(manifest)
-    op_id = f"op-{uuid.uuid4().hex[:8]}"
-    save_operation(op_id, "PENDING", manifest)
-    return render_template_string(HTML_TEMPLATE, operations=list_operations(10), wish_text=wish_text, plan=plan, operation_id=op_id, allowed=policy_result["allowed"])
 
-@app.route("/say/<op_id>/<decision>")
-def say(op_id, decision):
-    op = get_operation(op_id)
-    if not op:
-        return "Not found", 404
-    if decision == "no":
-        save_operation(op_id, "REJECTED", op["manifest"])
-    elif decision == "yes":
-        save_operation(op_id, "IN_PROGRESS", op["manifest"])
-        result = execute(op["manifest"])
-        save_operation(op_id, result.get("status", "UNKNOWN"), op["manifest"], result)
-    return redirect(url_for("index"))
-
-# ===================== ИНТЕРАКТИВНЫЙ CLI =====================
+# ---------- ИНТЕРАКТИВНЫЙ CLI ----------
 def run_interactive(user_text):
     print("WISH:", user_text)
     parsed = parse_wish(user_text)
@@ -395,7 +405,7 @@ def run_interactive(user_text):
     else:
         print("Отменено.")
 
-# ===================== ТОЧКА ВХОДА =====================
+# ---------- ТОЧКА ВХОДА ----------
 if __name__ == "__main__":
     init_db()
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h"):
@@ -413,7 +423,10 @@ if __name__ == "__main__":
     elif sys.argv[1] == "worker":
         run_worker()
     elif sys.argv[1] == "web":
-        print("🌐 Запуск веб-интерфейса: http://localhost:5000")
-        app.run(host="0.0.0.0", port=5000, debug=True)
+        if app is None:
+            print("Ошибка: Flask не установлен. Выполните: pip install flask")
+        else:
+            print("🌐 Запуск веб-интерфейса: http://localhost:5000")
+            app.run(host="0.0.0.0", port=5000, debug=True)
     else:
         print(f"Неизвестная команда: {sys.argv[1]}")
